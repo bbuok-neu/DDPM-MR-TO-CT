@@ -94,6 +94,29 @@ Generate CT images from test MR images with mixed precision:
 python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --output_dir ./results
 ```
 
+### Fast Sampling with DDIM
+
+Use DDIM sampler with fewer steps for faster inference (e.g., 50 steps instead of 1000):
+```bash
+python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --sampler ddim --num_inference_steps 50
+```
+
+DDIM with stochastic sampling (eta=1.0 makes it similar to DDPM):
+```bash
+python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --sampler ddim --num_inference_steps 100 --ddim_eta 0.5
+```
+
+### Timestep Respacing
+
+Both DDPM and DDIM support timestep respacing for accelerated sampling:
+```bash
+# DDPM with 250 steps (4x faster than default 1000)
+python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --sampler ddpm --num_inference_steps 250
+
+# DDIM with 50 steps (20x faster than default 1000)
+python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --sampler ddim --num_inference_steps 50
+```
+
 Disable mixed precision:
 ```bash
 python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --output_dir ./results --mixed_precision no
@@ -108,8 +131,10 @@ python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/
 | `--output_dir` | `./results` | Directory to save generated CT images |
 | `--image_size` | 256 | Image size (square) |
 | `--batch_size` | 1 | Batch size for inference |
-| `--num_inference_steps` | 1000 | Number of inference steps |
+| `--num_inference_steps` | 1000 | Number of inference steps (use 50-250 for faster sampling) |
 | `--num_workers` | 4 | Number of data loading workers |
+| `--sampler` | `ddpm` | Sampling method: `ddpm` or `ddim` |
+| `--ddim_eta` | 0.0 | DDIM eta parameter (0=deterministic, 1=stochastic like DDPM) |
 | `--mixed_precision` | `fp16` | Mixed precision mode (`no`, `fp16`, `bf16`) |
 
 ## Data Preprocessing
@@ -134,3 +159,4 @@ The model uses MONAI's `DiffusionModelUNet` with:
 
 - [MONAI Generative Models](https://github.com/Project-MONAI/GenerativeModels)
 - [Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2006.11239)
+- [Denoising Diffusion Implicit Models (DDIM)](https://arxiv.org/abs/2010.02502)

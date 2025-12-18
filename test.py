@@ -7,9 +7,13 @@ This script performs inference using a trained conditional DDPM model
 to generate CT images from MR images.
 
 Uses Hugging Face Accelerate for mixed precision inference.
+Supports DDPM and DDIM samplers with timestep respacing for faster sampling.
 
 Usage:
     python test.py --checkpoint /path/to/checkpoint.pt --dataset_dir /path/to/dataset --output_dir /path/to/output
+
+    # Fast sampling with DDIM (50 steps instead of 1000)
+    python test.py --checkpoint /path/to/checkpoint.pt --dataset_dir /path/to/dataset --sampler ddim --num_inference_steps 50
 
 The script will:
 1. Load test MR images from dataset_dir/mr/test/
@@ -30,7 +34,7 @@ from tqdm import tqdm
 from accelerate import Accelerator
 
 from monai.networks.nets import DiffusionModelUNet
-from monai.networks.schedulers import DDPMScheduler
+from monai.networks.schedulers import DDPMScheduler, DDIMScheduler
 
 
 class MRTestDataset(Dataset):
@@ -78,7 +82,7 @@ class MRTestDataset(Dataset):
         return {"mr": mr_tensor, "filename": filename}
 
 
-def sample(model, scheduler, mr_condition, accelerator, num_inference_steps=1000):
+def sample_ddpm(model, scheduler, mr_condition, accelerator, num_inference_steps=1000):
     """
     Sample CT image from MR condition using DDPM reverse process.
     
@@ -87,7 +91,7 @@ def sample(model, scheduler, mr_condition, accelerator, num_inference_steps=1000
         scheduler: DDPM scheduler
         mr_condition: MR image condition tensor (B, 1, H, W)
         accelerator: Accelerator instance for mixed precision
-        num_inference_steps: Number of inference steps
+        num_inference_steps: Number of inference steps (timestep respacing)
     
     Returns:
         Generated CT image tensor (B, 1, H, W)
@@ -101,19 +105,18 @@ def sample(model, scheduler, mr_condition, accelerator, num_inference_steps=1000
     # Start from random noise
     ct_sample = torch.randn((batch_size, 1, height, width), device=mr_condition.device)
     
-    # Set timesteps
+    # Set timesteps (timestep respacing)
     scheduler.set_timesteps(num_inference_steps=num_inference_steps)
     
     # Reverse diffusion process
     with torch.no_grad():
-        for t in tqdm(scheduler.timesteps, desc="Sampling", leave=False, disable=not accelerator.is_main_process):
+        for t in tqdm(scheduler.timesteps, desc="DDPM Sampling", leave=False, disable=not accelerator.is_main_process):
             # Create timestep tensor
             timestep = torch.tensor([t] * batch_size, device=mr_condition.device).long()
             
             # Concatenate current sample with MR condition
             model_input = torch.cat([ct_sample, mr_condition], dim=1)
             
-            # Mixed precision is handled automatically by Accelerator
             # Get model prediction (predicted noise)
             noise_pred = model(model_input, timestep)
             
@@ -121,6 +124,79 @@ def sample(model, scheduler, mr_condition, accelerator, num_inference_steps=1000
             ct_sample, _ = scheduler.step(noise_pred, t, ct_sample)
     
     return ct_sample
+
+
+def sample_ddim(model, scheduler, mr_condition, accelerator, num_inference_steps=50, eta=0.0):
+    """
+    Sample CT image from MR condition using DDIM reverse process.
+    
+    DDIM (Denoising Diffusion Implicit Models) allows for faster sampling
+    with fewer steps while maintaining quality.
+    
+    Args:
+        model: Trained DDPM model
+        scheduler: DDIM scheduler
+        mr_condition: MR image condition tensor (B, 1, H, W)
+        accelerator: Accelerator instance for mixed precision
+        num_inference_steps: Number of inference steps (can be much smaller than training steps)
+        eta: DDIM eta parameter (0 = deterministic, 1 = DDPM-like stochastic)
+    
+    Returns:
+        Generated CT image tensor (B, 1, H, W)
+    """
+    model.eval()
+    
+    batch_size = mr_condition.shape[0]
+    height = mr_condition.shape[2]
+    width = mr_condition.shape[3]
+    
+    # Start from random noise
+    ct_sample = torch.randn((batch_size, 1, height, width), device=mr_condition.device)
+    
+    # Set timesteps (timestep respacing for accelerated sampling)
+    scheduler.set_timesteps(num_inference_steps=num_inference_steps)
+    
+    # DDIM reverse diffusion process
+    with torch.no_grad():
+        for t in tqdm(scheduler.timesteps, desc="DDIM Sampling", leave=False, disable=not accelerator.is_main_process):
+            # Create timestep tensor
+            timestep = torch.tensor([t] * batch_size, device=mr_condition.device).long()
+            
+            # Concatenate current sample with MR condition
+            model_input = torch.cat([ct_sample, mr_condition], dim=1)
+            
+            # Get model prediction (predicted noise)
+            noise_pred = model(model_input, timestep)
+            
+            # Perform one step of the DDIM reverse diffusion
+            ct_sample, _ = scheduler.step(noise_pred, t, ct_sample, eta=eta)
+    
+    return ct_sample
+
+
+def sample(model, scheduler, mr_condition, accelerator, num_inference_steps=1000, 
+           sampler_type="ddpm", eta=0.0):
+    """
+    Sample CT image from MR condition using specified sampler.
+    
+    Args:
+        model: Trained DDPM model
+        scheduler: Scheduler (DDPM or DDIM)
+        mr_condition: MR image condition tensor (B, 1, H, W)
+        accelerator: Accelerator instance for mixed precision
+        num_inference_steps: Number of inference steps
+        sampler_type: "ddpm" or "ddim"
+        eta: DDIM eta parameter (only used for DDIM)
+    
+    Returns:
+        Generated CT image tensor (B, 1, H, W)
+    """
+    if sampler_type == "ddim":
+        return sample_ddim(model, scheduler, mr_condition, accelerator, 
+                          num_inference_steps, eta)
+    else:
+        return sample_ddpm(model, scheduler, mr_condition, accelerator, 
+                          num_inference_steps)
 
 
 def denormalize_and_save(tensor, save_path):
@@ -161,9 +237,16 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Batch size for inference")
     parser.add_argument("--num_inference_steps", type=int, default=1000,
-                        help="Number of inference steps")
+                        help="Number of inference steps (use smaller values like 50-250 for faster sampling)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of data loading workers")
+    
+    # Sampler arguments
+    parser.add_argument("--sampler", type=str, default="ddpm",
+                        choices=["ddpm", "ddim"],
+                        help="Sampling method: ddpm (slower, stochastic) or ddim (faster, can be deterministic)")
+    parser.add_argument("--ddim_eta", type=float, default=0.0,
+                        help="DDIM eta parameter (0=deterministic, 1=DDPM-like). Only used with --sampler ddim")
     
     # Mixed precision
     parser.add_argument("--mixed_precision", type=str, default="fp16",
@@ -219,8 +302,13 @@ def main():
     model.eval()
     accelerator.print("Model loaded successfully")
     
-    # Create scheduler
-    scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps)
+    # Create scheduler based on sampler type
+    if args.sampler == "ddim":
+        scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps)
+        accelerator.print(f"Using DDIM sampler with eta={args.ddim_eta}")
+    else:
+        scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps)
+        accelerator.print("Using DDPM sampler")
     
     # Create test dataset
     test_mr_dir = os.path.join(args.dataset_dir, "mr", "test")
@@ -237,7 +325,7 @@ def main():
     model, test_loader = accelerator.prepare(model, test_loader)
     
     # Inference loop
-    accelerator.print(f"Starting inference with {args.num_inference_steps} steps...")
+    accelerator.print(f"Starting inference with {args.num_inference_steps} steps using {args.sampler.upper()}...")
     
     for batch in tqdm(test_loader, desc="Processing", disable=not accelerator.is_main_process):
         mr_images = batch["mr"]
@@ -246,7 +334,9 @@ def main():
         # Sample CT from MR
         generated_ct = sample(
             model, scheduler, mr_images, accelerator,
-            num_inference_steps=args.num_inference_steps
+            num_inference_steps=args.num_inference_steps,
+            sampler_type=args.sampler,
+            eta=args.ddim_eta
         )
         
         # Save each generated image (only on main process)
