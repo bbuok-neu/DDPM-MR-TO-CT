@@ -7,8 +7,13 @@ This script trains a conditional DDPM model for MR-to-CT medical image synthesis
 The model takes 2-channel input (CT noisy image xt concatenated with MR condition)
 and outputs 1-channel (predicted noise epsilon).
 
+Uses Hugging Face Accelerate for mixed precision training and distributed training support.
+
 Usage:
     python train.py --dataset_dir /path/to/dataset --output_dir /path/to/output
+
+    # With Accelerate launcher for multi-GPU/distributed training:
+    accelerate launch train.py --dataset_dir /path/to/dataset --output_dir /path/to/output
 
 Dataset structure:
     dataset/
@@ -39,11 +44,13 @@ import glob
 
 import torch
 import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 
 from monai.networks.nets import DiffusionModelUNet
 from monai.networks.schedulers import DDPMScheduler
@@ -149,18 +156,39 @@ def get_args():
     parser.add_argument("--save_interval", type=int, default=10,
                         help="Checkpoint save interval (epochs)")
     
+    # Mixed precision
+    parser.add_argument("--mixed_precision", type=str, default="fp16",
+                        choices=["no", "fp16", "bf16"],
+                        help="Mixed precision training mode")
+    
+    # Random seed
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+    
     return parser.parse_args()
 
 
 def main():
     args = get_args()
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Initialize Accelerator for mixed precision training
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=1,
+    )
     
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Set random seed for reproducibility
+    set_seed(args.seed)
+    
+    # Create output directory (only on main process)
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    accelerator.wait_for_everyone()
+    
+    # Print device info
+    accelerator.print(f"Using device: {accelerator.device}")
+    accelerator.print(f"Mixed precision: {args.mixed_precision}")
     
     # Create datasets
     train_mr_dir = os.path.join(args.dataset_dir, "mr", "train")
@@ -190,9 +218,9 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=True
             )
-            print(f"Validation enabled with {len(val_dataset)} samples")
+            accelerator.print(f"Validation enabled with {len(val_dataset)} samples")
         else:
-            print("Warning: Test directory not found, validation disabled")
+            accelerator.print("Warning: Test directory not found, validation disabled")
     
     # Create model
     # 2-channel input: CT noisy image (xt) + MR condition
@@ -206,7 +234,6 @@ def main():
         num_res_blocks=(1, 1, 1),
         num_head_channels=256,
     )
-    model = model.to(device)
     
     # Create scheduler
     scheduler = DDPMScheduler(num_train_timesteps=args.num_train_timesteps)
@@ -214,26 +241,26 @@ def main():
     # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
-    # Create gradient scaler for mixed precision
-    scaler = GradScaler("cuda") if device.type == "cuda" else None
-    
     # Resume from checkpoint if specified
     start_epoch = 0
     if args.resume:
         if os.path.exists(args.resume):
-            print(f"Resuming from checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            accelerator.print(f"Resuming from checkpoint: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=accelerator.device)
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = checkpoint["epoch"] + 1
-            if scaler is not None and "scaler_state_dict" in checkpoint:
-                scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            print(f"Resumed from epoch {start_epoch}")
+            accelerator.print(f"Resumed from epoch {start_epoch}")
         else:
-            print(f"Warning: Checkpoint {args.resume} not found, starting from scratch")
+            accelerator.print(f"Warning: Checkpoint {args.resume} not found, starting from scratch")
+    
+    # Prepare model, optimizer, and dataloaders with Accelerator
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    if val_loader is not None:
+        val_loader = accelerator.prepare(val_loader)
     
     # Training loop
-    print(f"Starting training from epoch {start_epoch}")
+    accelerator.print(f"Starting training from epoch {start_epoch}")
     total_start = time.time()
     
     epoch_loss_list = []
@@ -243,59 +270,58 @@ def main():
         model.train()
         epoch_loss = 0.0
         
-        progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), ncols=80)
+        progress_bar = tqdm(
+            enumerate(train_loader), 
+            total=len(train_loader), 
+            ncols=80,
+            disable=not accelerator.is_main_process
+        )
         progress_bar.set_description(f"Epoch {epoch}")
         
         for step, batch in progress_bar:
-            mr_images = batch["mr"].to(device)  # (B, 1, H, W)
-            ct_images = batch["ct"].to(device)  # (B, 1, H, W)
+            mr_images = batch["mr"]  # (B, 1, H, W)
+            ct_images = batch["ct"]  # (B, 1, H, W)
             
             optimizer.zero_grad(set_to_none=True)
             
-            # Use autocast for mixed precision
-            with autocast(device_type=device.type, enabled=(device.type == "cuda")):
-                # Generate random noise
-                noise = torch.randn_like(ct_images).to(device)
-                
-                # Create random timesteps
-                timesteps = torch.randint(
-                    0, args.num_train_timesteps,
-                    (ct_images.shape[0],),
-                    device=device
-                ).long()
-                
-                # Add noise to CT images (forward diffusion)
-                noisy_ct = scheduler.add_noise(
-                    original_samples=ct_images,
-                    noise=noise,
-                    timesteps=timesteps
-                )
-                
-                # Concatenate noisy CT with MR condition
-                # Input: (B, 2, H, W) = [noisy_ct, mr]
-                model_input = torch.cat([noisy_ct, mr_images], dim=1)
-                
-                # Get model prediction (predicted noise)
-                noise_pred = model(model_input, timesteps)
-                
-                # Compute loss
-                loss = F.mse_loss(noise_pred.float(), noise.float())
+            # Mixed precision is handled automatically by Accelerator
+            # Generate random noise
+            noise = torch.randn_like(ct_images)
             
-            # Backward pass with gradient scaling
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+            # Create random timesteps
+            timesteps = torch.randint(
+                0, args.num_train_timesteps,
+                (ct_images.shape[0],),
+                device=ct_images.device
+            ).long()
+            
+            # Add noise to CT images (forward diffusion)
+            noisy_ct = scheduler.add_noise(
+                original_samples=ct_images,
+                noise=noise,
+                timesteps=timesteps
+            )
+            
+            # Concatenate noisy CT with MR condition
+            # Input: (B, 2, H, W) = [noisy_ct, mr]
+            model_input = torch.cat([noisy_ct, mr_images], dim=1)
+            
+            # Get model prediction (predicted noise)
+            noise_pred = model(model_input, timesteps)
+            
+            # Compute loss
+            loss = F.mse_loss(noise_pred.float(), noise.float())
+            
+            # Backward pass with Accelerator
+            accelerator.backward(loss)
+            optimizer.step()
             
             epoch_loss += loss.item()
             progress_bar.set_postfix({"loss": epoch_loss / (step + 1)})
         
         avg_epoch_loss = epoch_loss / len(train_loader)
         epoch_loss_list.append(avg_epoch_loss)
-        print(f"Epoch {epoch} - Average Loss: {avg_epoch_loss:.6f}")
+        accelerator.print(f"Epoch {epoch} - Average Loss: {avg_epoch_loss:.6f}")
         
         # Validation
         if args.enable_validation and val_loader is not None and (epoch + 1) % args.val_interval == 0:
@@ -304,63 +330,68 @@ def main():
             
             with torch.no_grad():
                 for step, batch in enumerate(val_loader):
-                    mr_images = batch["mr"].to(device)
-                    ct_images = batch["ct"].to(device)
+                    mr_images = batch["mr"]
+                    ct_images = batch["ct"]
                     
-                    with autocast(device_type=device.type, enabled=(device.type == "cuda")):
-                        noise = torch.randn_like(ct_images).to(device)
-                        timesteps = torch.randint(
-                            0, args.num_train_timesteps,
-                            (ct_images.shape[0],),
-                            device=device
-                        ).long()
-                        
-                        noisy_ct = scheduler.add_noise(
-                            original_samples=ct_images,
-                            noise=noise,
-                            timesteps=timesteps
-                        )
-                        
-                        model_input = torch.cat([noisy_ct, mr_images], dim=1)
-                        noise_pred = model(model_input, timesteps)
-                        loss = F.mse_loss(noise_pred.float(), noise.float())
+                    noise = torch.randn_like(ct_images)
+                    timesteps = torch.randint(
+                        0, args.num_train_timesteps,
+                        (ct_images.shape[0],),
+                        device=ct_images.device
+                    ).long()
+                    
+                    noisy_ct = scheduler.add_noise(
+                        original_samples=ct_images,
+                        noise=noise,
+                        timesteps=timesteps
+                    )
+                    
+                    model_input = torch.cat([noisy_ct, mr_images], dim=1)
+                    noise_pred = model(model_input, timesteps)
+                    loss = F.mse_loss(noise_pred.float(), noise.float())
                     
                     val_loss += loss.item()
             
             avg_val_loss = val_loss / len(val_loader)
             val_loss_list.append(avg_val_loss)
-            print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.6f}")
+            accelerator.print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.6f}")
         
-        # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0 or epoch == args.num_epochs - 1:
-            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pt")
-            checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_loss": avg_epoch_loss,
-                "args": vars(args)
-            }
-            if scaler is not None:
-                checkpoint["scaler_state_dict"] = scaler.state_dict()
-            
-            torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint: {checkpoint_path}")
-            
-            # Also save as latest
-            latest_path = os.path.join(args.output_dir, "checkpoint_latest.pt")
-            torch.save(checkpoint, latest_path)
+        # Save checkpoint (only on main process)
+        if accelerator.is_main_process:
+            if (epoch + 1) % args.save_interval == 0 or epoch == args.num_epochs - 1:
+                # Unwrap model for saving
+                unwrapped_model = accelerator.unwrap_model(model)
+                
+                checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pt")
+                checkpoint = {
+                    "epoch": epoch,
+                    "model_state_dict": unwrapped_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "train_loss": avg_epoch_loss,
+                    "args": vars(args)
+                }
+                
+                torch.save(checkpoint, checkpoint_path)
+                accelerator.print(f"Saved checkpoint: {checkpoint_path}")
+                
+                # Also save as latest
+                latest_path = os.path.join(args.output_dir, "checkpoint_latest.pt")
+                torch.save(checkpoint, latest_path)
+        
+        accelerator.wait_for_everyone()
     
     total_time = time.time() - total_start
-    print(f"Training completed in {total_time:.2f} seconds")
+    accelerator.print(f"Training completed in {total_time:.2f} seconds")
     
-    # Save final model
-    final_path = os.path.join(args.output_dir, "model_final.pt")
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "args": vars(args)
-    }, final_path)
-    print(f"Saved final model: {final_path}")
+    # Save final model (only on main process)
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        final_path = os.path.join(args.output_dir, "model_final.pt")
+        torch.save({
+            "model_state_dict": unwrapped_model.state_dict(),
+            "args": vars(args)
+        }, final_path)
+        accelerator.print(f"Saved final model: {final_path}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # MR-to-CT Medical Image Synthesis using Conditional DDPM
 
-This project implements a conditional Denoising Diffusion Probabilistic Model (DDPM) for MR-to-CT medical image synthesis using MONAI.
+This project implements a conditional Denoising Diffusion Probabilistic Model (DDPM) for MR-to-CT medical image synthesis using MONAI and Hugging Face Accelerate.
 
 ## Overview
 
@@ -9,6 +9,7 @@ The model performs modality transfer from MR (Magnetic Resonance) images to CT (
 - **Input**: 2 channels (CT noisy image xt concatenated with MR condition)
 - **Output**: 1 channel (predicted noise epsilon)
 - **Model**: DiffusionModelUNet from MONAI
+- **Training/Inference**: Hugging Face Accelerate for mixed precision and distributed training
 
 ## Dataset Structure
 
@@ -42,7 +43,7 @@ pip install -r requirements.txt
 
 ## Training
 
-Basic training:
+Basic training with mixed precision (FP16):
 ```bash
 python train.py --dataset_dir /path/to/dataset --output_dir ./checkpoints
 ```
@@ -55,6 +56,16 @@ python train.py --dataset_dir /path/to/dataset --output_dir ./checkpoints --enab
 Resume training from checkpoint:
 ```bash
 python train.py --dataset_dir /path/to/dataset --output_dir ./checkpoints --resume ./checkpoints/checkpoint_latest.pt
+```
+
+Disable mixed precision:
+```bash
+python train.py --dataset_dir /path/to/dataset --output_dir ./checkpoints --mixed_precision no
+```
+
+Multi-GPU training with Accelerate launcher:
+```bash
+accelerate launch train.py --dataset_dir /path/to/dataset --output_dir ./checkpoints
 ```
 
 ### Training Arguments
@@ -73,12 +84,19 @@ python train.py --dataset_dir /path/to/dataset --output_dir ./checkpoints --resu
 | `--val_interval` | 5 | Validation interval (epochs) |
 | `--enable_validation` | False | Enable online validation |
 | `--save_interval` | 10 | Checkpoint save interval (epochs) |
+| `--mixed_precision` | `fp16` | Mixed precision mode (`no`, `fp16`, `bf16`) |
+| `--seed` | 42 | Random seed for reproducibility |
 
 ## Testing/Inference
 
-Generate CT images from test MR images:
+Generate CT images from test MR images with mixed precision:
 ```bash
 python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --output_dir ./results
+```
+
+Disable mixed precision:
+```bash
+python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/dataset --output_dir ./results --mixed_precision no
 ```
 
 ### Testing Arguments
@@ -92,6 +110,7 @@ python test.py --checkpoint ./checkpoints/model_final.pt --dataset_dir /path/to/
 | `--batch_size` | 1 | Batch size for inference |
 | `--num_inference_steps` | 1000 | Number of inference steps |
 | `--num_workers` | 4 | Number of data loading workers |
+| `--mixed_precision` | `fp16` | Mixed precision mode (`no`, `fp16`, `bf16`) |
 
 ## Data Preprocessing
 

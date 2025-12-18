@@ -6,6 +6,8 @@ MR-to-CT Conditional DDPM Testing/Inference Script
 This script performs inference using a trained conditional DDPM model
 to generate CT images from MR images.
 
+Uses Hugging Face Accelerate for mixed precision inference.
+
 Usage:
     python test.py --checkpoint /path/to/checkpoint.pt --dataset_dir /path/to/dataset --output_dir /path/to/output
 
@@ -20,11 +22,12 @@ import argparse
 import glob
 
 import torch
-from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+
+from accelerate import Accelerator
 
 from monai.networks.nets import DiffusionModelUNet
 from monai.networks.schedulers import DDPMScheduler
@@ -75,7 +78,7 @@ class MRTestDataset(Dataset):
         return {"mr": mr_tensor, "filename": filename}
 
 
-def sample(model, scheduler, mr_condition, device, num_inference_steps=1000):
+def sample(model, scheduler, mr_condition, accelerator, num_inference_steps=1000):
     """
     Sample CT image from MR condition using DDPM reverse process.
     
@@ -83,7 +86,7 @@ def sample(model, scheduler, mr_condition, device, num_inference_steps=1000):
         model: Trained DDPM model
         scheduler: DDPM scheduler
         mr_condition: MR image condition tensor (B, 1, H, W)
-        device: Device to use
+        accelerator: Accelerator instance for mixed precision
         num_inference_steps: Number of inference steps
     
     Returns:
@@ -96,23 +99,23 @@ def sample(model, scheduler, mr_condition, device, num_inference_steps=1000):
     width = mr_condition.shape[3]
     
     # Start from random noise
-    ct_sample = torch.randn((batch_size, 1, height, width), device=device)
+    ct_sample = torch.randn((batch_size, 1, height, width), device=mr_condition.device)
     
     # Set timesteps
     scheduler.set_timesteps(num_inference_steps=num_inference_steps)
     
     # Reverse diffusion process
     with torch.no_grad():
-        for t in tqdm(scheduler.timesteps, desc="Sampling", leave=False):
+        for t in tqdm(scheduler.timesteps, desc="Sampling", leave=False, disable=not accelerator.is_main_process):
             # Create timestep tensor
-            timestep = torch.tensor([t] * batch_size, device=device).long()
+            timestep = torch.tensor([t] * batch_size, device=mr_condition.device).long()
             
             # Concatenate current sample with MR condition
             model_input = torch.cat([ct_sample, mr_condition], dim=1)
             
-            with autocast(device_type=device.type, enabled=(device.type == "cuda")):
-                # Get model prediction (predicted noise)
-                noise_pred = model(model_input, timestep)
+            # Mixed precision is handled automatically by Accelerator
+            # Get model prediction (predicted noise)
+            noise_pred = model(model_input, timestep)
             
             # Perform one step of the reverse diffusion
             ct_sample, _ = scheduler.step(noise_pred, t, ct_sample)
@@ -162,22 +165,34 @@ def get_args():
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of data loading workers")
     
+    # Mixed precision
+    parser.add_argument("--mixed_precision", type=str, default="fp16",
+                        choices=["no", "fp16", "bf16"],
+                        help="Mixed precision inference mode")
+    
     return parser.parse_args()
 
 
 def main():
     args = get_args()
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Initialize Accelerator for mixed precision inference
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+    )
     
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Create output directory (only on main process)
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    accelerator.wait_for_everyone()
+    
+    accelerator.print(f"Using device: {accelerator.device}")
+    accelerator.print(f"Mixed precision: {args.mixed_precision}")
     
     # Load checkpoint
-    print(f"Loading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    accelerator.print(f"Loading checkpoint: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, map_location=accelerator.device)
     
     # Get model args from checkpoint if available
     if "args" in checkpoint:
@@ -201,9 +216,8 @@ def main():
     
     # Load model weights
     model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
     model.eval()
-    print("Model loaded successfully")
+    accelerator.print("Model loaded successfully")
     
     # Create scheduler
     scheduler = DDPMScheduler(num_train_timesteps=num_train_timesteps)
@@ -219,28 +233,32 @@ def main():
         pin_memory=True
     )
     
-    # Inference loop
-    print(f"Starting inference with {args.num_inference_steps} steps...")
+    # Prepare model and dataloader with Accelerator
+    model, test_loader = accelerator.prepare(model, test_loader)
     
-    for batch in tqdm(test_loader, desc="Processing"):
-        mr_images = batch["mr"].to(device)
+    # Inference loop
+    accelerator.print(f"Starting inference with {args.num_inference_steps} steps...")
+    
+    for batch in tqdm(test_loader, desc="Processing", disable=not accelerator.is_main_process):
+        mr_images = batch["mr"]
         filenames = batch["filename"]
         
         # Sample CT from MR
         generated_ct = sample(
-            model, scheduler, mr_images, device,
+            model, scheduler, mr_images, accelerator,
             num_inference_steps=args.num_inference_steps
         )
         
-        # Save each generated image
-        for i, filename in enumerate(filenames):
-            # Change extension to indicate it's generated CT
-            base_name = os.path.splitext(filename)[0]
-            save_path = os.path.join(args.output_dir, f"{base_name}_generated_ct.jpg")
-            
-            denormalize_and_save(generated_ct[i], save_path)
+        # Save each generated image (only on main process)
+        if accelerator.is_main_process:
+            for i, filename in enumerate(filenames):
+                # Change extension to indicate it's generated CT
+                base_name = os.path.splitext(filename)[0]
+                save_path = os.path.join(args.output_dir, f"{base_name}_generated_ct.jpg")
+                
+                denormalize_and_save(generated_ct[i], save_path)
     
-    print(f"Inference complete. Results saved to {args.output_dir}")
+    accelerator.print(f"Inference complete. Results saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
